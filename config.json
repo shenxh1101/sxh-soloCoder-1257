@@ -4,7 +4,9 @@
   "ignore_folders": [],
   "report": "photo_organize_report.md",
   "duplicate_csv": "duplicates.csv",
+  "plan_file": "plan.json",
   "state_file": "library_state.json",
+  "isolation_dir": "隔离重复",
   "dry_run": false,
   "incremental": true,
   "duplicate_mode": "separate"

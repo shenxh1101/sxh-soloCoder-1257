@@ -33,7 +33,9 @@ DEFAULT_CONFIG = {
     "ignore_folders": [],
     "report": "photo_organize_report.md",
     "duplicate_csv": "duplicates.csv",
+    "plan_file": "plan.json",
     "state_file": "library_state.json",
+    "isolation_dir": "隔离重复",
     "dry_run": False,
     "incremental": True,
     "duplicate_mode": "separate",
@@ -56,21 +58,18 @@ def save_default_config(config_path):
         json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
 
 
-def load_state(state_path):
-    p = Path(state_path)
+def load_json(path):
+    p = Path(path)
     if not p.exists():
-        return {'photos': {}}
+        return None
     with open(p, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    if 'photos' not in data:
-        data['photos'] = {}
-    return data
+        return json.load(f)
 
 
-def save_state(state_path, state):
-    p = Path(state_path)
+def save_json(path, data):
+    p = Path(path)
     with open(p, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def get_exif_datetime(file_path):
@@ -143,20 +142,27 @@ def find_photos(source_dir, ignore_folders):
     return photos
 
 
-def scan_dest_photos(dest_dir, ignore_folders):
-    photos = []
+def scan_dest_library(dest_dir, ignore_folders):
     dest_path = Path(dest_dir).resolve()
     duplicate_dir = dest_path / '可能重复'
-    extra_ignore = [duplicate_dir] + list(ignore_folders)
+    isolation_dir = dest_path / '隔离重复'
+    extra_ignore = [duplicate_dir, isolation_dir] + list(ignore_folders)
+
+    md5_to_paths = defaultdict(list)
     for root, dirs, files in os.walk(dest_path):
         dirs[:] = [d for d in dirs if not is_ignored(Path(root) / d, extra_ignore)]
         if is_ignored(root, extra_ignore):
             continue
         for file in files:
             file_path = Path(root) / file
-            if file_path.suffix.lower() in PHOTO_EXTENSIONS:
-                photos.append(file_path)
-    return photos
+            if file_path.suffix.lower() not in PHOTO_EXTENSIONS:
+                continue
+            try:
+                md5 = calculate_md5(file_path)
+                md5_to_paths[md5].append(str(file_path.resolve()))
+            except Exception:
+                pass
+    return md5_to_paths
 
 
 class TargetPathAllocator:
@@ -194,15 +200,22 @@ class TargetPathAllocator:
 def check_library_health(dest_dir, ignore_folders):
     dest_path = Path(dest_dir).resolve()
     duplicate_dir = dest_path / '可能重复'
-    extra_ignore = [duplicate_dir] + list(ignore_folders)
+    isolation_dir = dest_path / '隔离重复'
+    extra_ignore = [duplicate_dir, isolation_dir] + list(ignore_folders)
 
     md5_map = defaultdict(list)
-    no_time_count = 0
+    no_exif_has_mtime = 0
+    no_time_at_all = 0
+    read_failed = 0
+    read_failed_list = []
     empty_month_dirs = []
 
     for root, dirs, files in os.walk(dest_path):
         current_root = Path(root).resolve()
-        rel_parts = current_root.relative_to(dest_path).parts
+        try:
+            rel_parts = current_root.relative_to(dest_path).parts
+        except ValueError:
+            continue
         if is_ignored(root, extra_ignore):
             dirs[:] = []
             continue
@@ -215,13 +228,21 @@ def check_library_health(dest_dir, ignore_folders):
             if file_path.suffix.lower() not in PHOTO_EXTENSIONS:
                 continue
             try:
-                dt, ts = get_photo_datetime(file_path)
-                if ts == 'ModifyTime':
-                    no_time_count += 1
+                exif_dt = get_exif_datetime(file_path)
+                if exif_dt is not None:
+                    pass
+                else:
+                    try:
+                        mtime = os.path.getmtime(file_path)
+                        datetime.fromtimestamp(mtime)
+                        no_exif_has_mtime += 1
+                    except Exception:
+                        no_time_at_all += 1
                 md5 = calculate_md5(file_path)
                 md5_map[md5].append(str(file_path))
-            except Exception:
-                no_time_count += 1
+            except Exception as e:
+                read_failed += 1
+                read_failed_list.append((str(file_path), str(e)))
 
     dup_count = sum(1 for v in md5_map.values() if len(v) > 1)
     dup_file_count = sum(len(v) for v in md5_map.values() if len(v) > 1) - dup_count
@@ -231,19 +252,28 @@ def check_library_health(dest_dir, ignore_folders):
         'duplicate_files': dup_file_count,
         'empty_month_dirs': len(empty_month_dirs),
         'empty_month_dir_list': empty_month_dirs,
-        'no_exif_time_count': no_time_count,
+        'no_exif_has_mtime': no_exif_has_mtime,
+        'no_time_at_all': no_time_at_all,
+        'read_failed': read_failed,
+        'read_failed_list': read_failed_list,
     }
 
 
 def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
                     duplicate_mode='separate', incremental=True, state_file=None,
-                    duplicate_csv=None):
+                    duplicate_csv=None, plan_file=None):
     source_dir = Path(source_dir).resolve()
     dest_dir = Path(dest_dir).resolve()
     duplicate_dir = dest_dir / '可能重复'
 
-    state = load_state(state_file) if incremental and state_file else {'photos': {}}
-    known_md5s = {entry['md5']: entry for entry in state['photos'].values()}
+    state = load_json(state_file) if incremental and state_file else {'photos': {}}
+    known_md5s = {entry['md5']: entry for entry in state.get('photos', {}).values()}
+
+    dest_md5_map = scan_dest_library(dest_dir, ignore_folders)
+    dest_md5_lookup = {}
+    for md5, paths in dest_md5_map.items():
+        for p in paths:
+            dest_md5_lookup[md5] = p
 
     allocator = TargetPathAllocator(dest_dir)
 
@@ -255,7 +285,6 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
     skipped = []
     time_source_stats = {'EXIF': 0, 'ModifyTime': 0}
     photo_info_map = {}
-    source_path_to_md5 = {}
 
     print(f"发现照片总数: {len(photos)}")
 
@@ -263,7 +292,6 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
         try:
             photo_dt, time_source = get_photo_datetime(photo_path)
             md5 = calculate_md5(photo_path)
-            source_path_to_md5[str(photo_path)] = md5
             md5_map[md5].append(photo_path)
             photo_info_map[photo_path] = {
                 'datetime': photo_dt,
@@ -272,9 +300,8 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
             }
             time_source_stats[time_source] += 1
         except Exception as e:
-            skipped.append((str(photo_path), f"处理失败: {e}"))
+            skipped.append((str(photo_path), f'处理失败: {e}'))
 
-    skip_reasons = []
     for md5, file_list in md5_map.items():
         file_list.sort(key=lambda p: photo_info_map[p]['datetime'])
         is_dup_group = len(file_list) > 1
@@ -282,16 +309,26 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
         kept = file_list[0]
         kept_info = photo_info_map[kept]
 
-        if incremental and md5 in known_md5s:
-            existing_entry = known_md5s[md5]
-            existing_target = existing_entry.get('target_path', '')
-            existing_source = existing_entry.get('source_path', '')
-            if str(kept) == existing_source:
-                skip_reasons.append((str(kept), '增量模式：已整理且内容未变化', md5, existing_target))
+        in_state = incremental and md5 in known_md5s
+        in_dest = md5 in dest_md5_lookup
+
+        if in_state or in_dest:
+            if in_state:
+                existing = known_md5s[md5]
+                existing_target = existing.get('target_path', '')
+                existing_source = existing.get('source_path', '')
+                if str(kept) == existing_source:
+                    skip_reason = f'增量模式：已整理且内容未变化 (目标: {existing_target})'
+                else:
+                    skip_reason = f'增量模式：照片已存在于目标库 (原路径: {existing_source}, 目标: {existing_target})'
             else:
-                skip_reasons.append((str(kept), f'增量模式：照片已存在于目标库 (原路径: {existing_source})', md5, existing_target))
+                dest_path_found = dest_md5_lookup[md5]
+                skip_reason = f'目标库扫描：内容相同的照片已存在 (目标位置: {dest_path_found})'
+
+            skipped.append((str(kept), skip_reason))
             for dup_path in file_list[1:]:
-                skip_reasons.append((str(dup_path), '增量模式：与已入库照片重复', md5, existing_target))
+                dup_info = photo_info_map[dup_path]
+                skipped.append((str(dup_path), f'与已入库照片重复 (MD5: {md5[:8]}...)'))
             continue
 
         year = kept_info['datetime'].strftime('%Y')
@@ -330,10 +367,31 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
                         dup_dt, dup_info['time_source'], dup_info['md5'],
                     ))
 
-    for src, reason, md5, target in skip_reasons:
-        skipped.append((src, reason))
-
     all_operations = move_operations + duplicate_operations
+
+    plan_data = None
+    if plan_file and dry_run:
+        plan_data = {
+            'created_at': datetime.now().isoformat(),
+            'source_dir': str(source_dir),
+            'dest_dir': str(dest_dir),
+            'duplicate_mode': duplicate_mode,
+            'move_operations': [
+                {'source': op[0], 'target': op[1], 'type': op[2],
+                 'datetime': op[3].isoformat() if isinstance(op[3], datetime) else '',
+                 'time_source': op[4], 'md5': op[5]}
+                for op in move_operations
+            ],
+            'duplicate_operations': [
+                {'source': op[0], 'target': op[1], 'type': op[2],
+                 'datetime': op[3].isoformat() if isinstance(op[3], datetime) else '',
+                 'time_source': op[4], 'md5': op[5]}
+                for op in duplicate_operations
+            ],
+            'skipped': [{'path': s[0], 'reason': s[1]} for s in skipped],
+        }
+        save_json(plan_file, plan_data)
+        print(f"计划文件已保存: {Path(plan_file).resolve()}")
 
     if not dry_run:
         for op in all_operations:
@@ -344,7 +402,7 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(src, dst)
             if op_type in ('kept', 'normal') and incremental and state_file:
-                state['photos'][md5] = {
+                state.setdefault('photos', {})[md5] = {
                     'md5': md5,
                     'source_path': src,
                     'target_path': dst,
@@ -354,7 +412,7 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
                 }
 
         if incremental and state_file:
-            save_state(state_file, state)
+            save_json(state_file, state)
 
     monthly_stats = _build_monthly_stats(move_operations, duplicate_operations)
     health_stats = check_library_health(dest_dir, ignore_folders)
@@ -371,11 +429,131 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
     return report, all_operations, health_stats
 
 
+def execute_plan(plan_path, incremental=True, state_file=None):
+    plan = load_json(plan_path)
+    if not plan:
+        print(f"错误: 计划文件不存在或格式错误: {plan_path}")
+        return
+
+    move_ops = plan.get('move_operations', [])
+    dup_ops = plan.get('duplicate_operations', [])
+
+    all_ops = move_ops + dup_ops
+
+    print(f"执行计划文件: {plan_path}")
+    print(f"计划移动: {len(move_ops)} 个文件")
+    print(f"计划重复处理: {len(dup_ops)} 个文件")
+
+    state = load_json(state_file) if incremental and state_file else {'photos': {}}
+
+    for op in all_ops:
+        src = op['source']
+        dst = op['target']
+        op_type = op['type']
+        md5 = op.get('md5', '')
+
+        if op_type == 'duplicate_listed':
+            continue
+
+        if not Path(src).exists():
+            print(f"警告: 源文件不存在，跳过: {src}")
+            continue
+
+        dst_path = Path(dst)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(src, dst)
+        print(f"  移动: {src} -> {dst}")
+
+        if op_type in ('kept', 'normal') and incremental and state_file:
+            state.setdefault('photos', {})[md5] = {
+                'md5': md5,
+                'source_path': src,
+                'target_path': dst,
+                'datetime': op.get('datetime', ''),
+                'time_source': op.get('time_source', ''),
+                'added_at': datetime.now().isoformat(),
+            }
+
+    if incremental and state_file:
+        save_json(state_file, state)
+
+    print(f"\n计划执行完成! 共处理 {len(all_ops)} 个操作")
+
+
+def clean_duplicates(dest_dir, ignore_folders, plan_only=True, isolation_dir_name='隔离重复', duplicate_csv=None):
+    dest_path = Path(dest_dir).resolve()
+    isolation_path = dest_path / isolation_dir_name
+    duplicate_dir = dest_path / '可能重复'
+    extra_ignore = [duplicate_dir, isolation_path] + list(ignore_folders)
+
+    md5_map = defaultdict(list)
+    for root, dirs, files in os.walk(dest_path):
+        dirs[:] = [d for d in dirs if not is_ignored(Path(root) / d, extra_ignore)]
+        if is_ignored(root, extra_ignore):
+            continue
+        for file in files:
+            file_path = Path(root) / file
+            if file_path.suffix.lower() not in PHOTO_EXTENSIONS:
+                continue
+            try:
+                md5 = calculate_md5(file_path)
+                md5_map[md5].append(str(file_path.resolve()))
+            except Exception:
+                pass
+
+    clean_groups = []
+    for md5, paths in md5_map.items():
+        if len(paths) <= 1:
+            continue
+        paths.sort()
+        kept = paths[0]
+        to_isolate = paths[1:]
+        clean_groups.append({
+            'group_id': len(clean_groups) + 1,
+            'md5': md5,
+            'kept': kept,
+            'isolated': to_isolate,
+        })
+
+    if duplicate_csv:
+        with open(duplicate_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                '重复组编号', 'MD5', '操作', '文件路径',
+                '隔离目标路径',
+            ])
+            for group in clean_groups:
+                writer.writerow([
+                    group['group_id'], group['md5'], '保留', group['kept'], '',
+                ])
+                for iso_path in group['isolated']:
+                    rel = Path(iso_path).relative_to(dest_path)
+                    iso_target = str(isolation_path / rel)
+                    writer.writerow([
+                        group['group_id'], group['md5'], '隔离', iso_path, iso_target,
+                    ])
+        print(f"清理清单已导出: {Path(duplicate_csv).resolve()}")
+
+    if not plan_only:
+        for group in clean_groups:
+            for iso_path_str in group['isolated']:
+                src = Path(iso_path_str)
+                if not src.exists():
+                    continue
+                rel = src.relative_to(dest_path)
+                target = isolation_path / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(target))
+        print(f"清理完成! 共隔离 {sum(len(g['isolated']) for g in clean_groups)} 个重复文件到 {isolation_path}")
+
+    return clean_groups
+
+
 def export_duplicate_csv(csv_path, duplicate_operations, md5_map):
     md5_to_group = {}
     group_id = 1
-    for md5, file_list in md5_map.items():
-        if len(file_list) > 1:
+    for md5 in md5_map:
+        if len(md5_map[md5]) > 1:
             md5_to_group[md5] = group_id
             group_id += 1
 
@@ -387,9 +565,9 @@ def export_duplicate_csv(csv_path, duplicate_operations, md5_map):
         ])
         for op in duplicate_operations:
             src, dst, op_type, dt, time_source, md5 = op
-            group_id = md5_to_group.get(md5, '')
+            gid = md5_to_group.get(md5, '')
             writer.writerow([
-                group_id, src, dst, md5,
+                gid, src, dst, md5,
                 dt.isoformat() if isinstance(dt, datetime) else '',
                 time_source, op_type,
             ])
@@ -401,7 +579,7 @@ def _build_monthly_stats(move_operations, duplicate_operations):
         'moved': 0, 'duplicate': 0, 'exif': 0, 'modify_time': 0,
     })
     for op in move_operations:
-        src, dst, op_type, dt, time_source = op[0], op[1], op[2], op[3], op[4]
+        dt, time_source = op[3], op[4]
         key = dt.strftime('%Y-%m')
         stats[key]['moved'] += 1
         if time_source == 'EXIF':
@@ -409,7 +587,7 @@ def _build_monthly_stats(move_operations, duplicate_operations):
         else:
             stats[key]['modify_time'] += 1
     for op in duplicate_operations:
-        src, dst, op_type, dt, time_source = op[0], op[1], op[2], op[3], op[4]
+        dt, time_source = op[3], op[4]
         key = dt.strftime('%Y-%m')
         stats[key]['duplicate'] += 1
         if time_source == 'EXIF':
@@ -446,19 +624,24 @@ def generate_markdown_report(source_dir, dest_dir, move_operations, duplicate_op
         "## 相册库健康检查",
         "",
         f"- 目标库重复文件组: {health_stats['duplicate_groups']}",
-        f"- 目标库重复文件数: {health_stats['duplicate_files']}",
+        f"- 目标库重复文件数(多余): {health_stats['duplicate_files']}",
         f"- 空月份文件夹: {health_stats['empty_month_dirs']}",
-        f"- 无EXIF时间(使用修改时间): {health_stats['no_exif_time_count']}",
+        f"- 无EXIF但可用修改时间: {health_stats['no_exif_has_mtime']}",
+        f"- 完全无法获取时间: {health_stats['no_time_at_all']}",
+        f"- 读取文件失败: {health_stats['read_failed']}",
         "",
     ]
 
     if health_stats['empty_month_dir_list']:
-        report_lines.extend([
-            "### 空月份文件夹列表",
-            "",
-        ])
+        report_lines.extend(["### 空月份文件夹列表", ""])
         for d in health_stats['empty_month_dir_list']:
             report_lines.append(f"- `{d}`")
+        report_lines.append("")
+
+    if health_stats['read_failed_list']:
+        report_lines.extend(["### 读取失败文件列表", ""])
+        for fp, err in health_stats['read_failed_list']:
+            report_lines.append(f"- `{fp}`: {err}")
         report_lines.append("")
 
     report_lines.extend([
@@ -496,8 +679,7 @@ def generate_markdown_report(source_dir, dest_dir, move_operations, duplicate_op
         ])
         for idx, op in enumerate(move_operations, 1):
             src, dst, op_type, dt, time_source, md5 = op
-            short_md5 = md5[:8]
-            report_lines.append(f"| {idx} | `{src}` | `{dst}` | {time_source} | `{short_md5}` |")
+            report_lines.append(f"| {idx} | `{src}` | `{dst}` | {time_source} | `{md5[:8]}` |")
         report_lines.append("")
 
     if duplicate_operations:
@@ -517,8 +699,7 @@ def generate_markdown_report(source_dir, dest_dir, move_operations, duplicate_op
         ])
         for idx, op in enumerate(duplicate_operations, 1):
             src, dst, op_type, dt, time_source, md5 = op
-            short_md5 = md5[:8]
-            report_lines.append(f"| {idx} | `{src}` | `{dst}` | {time_source} | `{short_md5}` |")
+            report_lines.append(f"| {idx} | `{src}` | `{dst}` | {time_source} | `{md5[:8]}` |")
         report_lines.append("")
 
     if skipped:
@@ -533,6 +714,40 @@ def generate_markdown_report(source_dir, dest_dir, move_operations, duplicate_op
         report_lines.append("")
 
     return "\n".join(report_lines)
+
+
+def generate_clean_report(clean_groups, dest_dir, isolation_dir_name):
+    dest_path = Path(dest_dir).resolve()
+    isolation_path = dest_path / isolation_dir_name
+
+    lines = [
+        "# 重复照片清理报告",
+        "",
+        f"- 清理时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 目标目录: `{dest_path}`",
+        f"- 隔离目录: `{isolation_path}`",
+        f"- 重复组数: {len(clean_groups)}",
+        f"- 保留文件数: {len(clean_groups)}",
+        f"- 隔离文件数: {sum(len(g['isolated']) for g in clean_groups)}",
+        "",
+    ]
+
+    for group in clean_groups:
+        lines.extend([
+            f"### 重复组 {group['group_id']}",
+            "",
+            f"- **保留**: `{group['kept']}`",
+            f"- MD5: `{group['md5']}`",
+            f"- 隔离文件:",
+            "",
+        ])
+        for iso_path in group['isolated']:
+            rel = Path(iso_path).relative_to(dest_path)
+            target = isolation_path / rel
+            lines.append(f"  - `{iso_path}` → `{target}`")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def main():
@@ -551,20 +766,27 @@ def main():
     parser.add_argument('--no-dry-run', action='store_true', default=None,
                         help='取消试运行，实际执行移动')
     parser.add_argument('--incremental', action='store_true', default=None,
-                        help='启用增量整理模式，跳过已处理且内容未变的照片')
+                        help='启用增量整理模式')
     parser.add_argument('--no-incremental', action='store_true', default=None,
                         help='关闭增量整理模式')
-    parser.add_argument('--report', default=None,
-                        help='Markdown报告文件名')
+    parser.add_argument('--report', default=None, help='Markdown报告文件名')
     parser.add_argument('--duplicate-csv', default=None,
                         help='重复照片清单CSV导出路径')
+    parser.add_argument('--plan-file', default=None,
+                        help='计划文件路径 (试运行时保存，正式执行时可用 --execute-plan)')
+    parser.add_argument('--execute-plan', default=None,
+                        help='按计划文件执行移动操作')
     parser.add_argument('--state-file', default=None,
                         help='增量整理状态文件路径 (JSON)')
     parser.add_argument('--duplicate-mode', choices=['list_only', 'separate', 'move'],
                         default=None,
-                        help='重复文件处理策略: list_only=仅列出, separate=移至独立目录保留相对路径, move=移至可能重复文件夹')
+                        help='重复文件处理策略')
     parser.add_argument('--health-check-only', action='store_true',
                         help='仅执行健康检查，不整理照片')
+    parser.add_argument('--clean-duplicates', action='store_true',
+                        help='清理目标库重复照片(默认仅生成清单)')
+    parser.add_argument('--clean-execute', action='store_true',
+                        help='配合 --clean-duplicates 使用，实际执行隔离(否则仅生成清单)')
 
     args = parser.parse_args()
 
@@ -601,8 +823,14 @@ def main():
 
     report_path = args.report if args.report is not None else cfg.get('report', 'photo_organize_report.md')
     duplicate_csv = args.duplicate_csv if args.duplicate_csv is not None else cfg.get('duplicate_csv', 'duplicates.csv')
+    plan_file = args.plan_file if args.plan_file is not None else cfg.get('plan_file', 'plan.json')
     state_file = args.state_file if args.state_file is not None else cfg.get('state_file', 'library_state.json')
     duplicate_mode = args.duplicate_mode if args.duplicate_mode is not None else cfg.get('duplicate_mode', 'separate')
+    isolation_dir_name = cfg.get('isolation_dir', '隔离重复')
+
+    if args.execute_plan:
+        execute_plan(args.execute_plan, incremental=incremental, state_file=state_file)
+        sys.exit(0)
 
     if not destination:
         print("错误: 未指定目标目录。请通过命令行参数或配置文件提供 destination。")
@@ -613,13 +841,41 @@ def main():
         health_stats = check_library_health(destination, ignore_folders)
         print(f"\n目标库健康检查结果:")
         print(f"  重复文件组: {health_stats['duplicate_groups']}")
-        print(f"  重复文件数: {health_stats['duplicate_files']}")
+        print(f"  重复文件数(多余): {health_stats['duplicate_files']}")
         print(f"  空月份文件夹: {health_stats['empty_month_dirs']}")
-        print(f"  无EXIF时间(使用修改时间): {health_stats['no_exif_time_count']}")
+        print(f"  无EXIF但可用修改时间: {health_stats['no_exif_has_mtime']}")
+        print(f"  完全无法获取时间: {health_stats['no_time_at_all']}")
+        print(f"  读取文件失败: {health_stats['read_failed']}")
         if health_stats['empty_month_dir_list']:
             print(f"\n空月份文件夹列表:")
             for d in health_stats['empty_month_dir_list']:
                 print(f"  - {d}")
+        if health_stats['read_failed_list']:
+            print(f"\n读取失败文件:")
+            for fp, err in health_stats['read_failed_list']:
+                print(f"  - {fp}: {err}")
+        sys.exit(0)
+
+    if args.clean_duplicates:
+        print("清理目标库重复照片...")
+        plan_only = not args.clean_execute
+        if plan_only:
+            print("模式: 仅生成清理清单 (使用 --clean-execute 实际执行隔离)")
+        else:
+            print("模式: 实际执行隔离")
+
+        clean_groups = clean_duplicates(
+            destination, ignore_folders,
+            plan_only=plan_only,
+            isolation_dir_name=isolation_dir_name,
+            duplicate_csv=duplicate_csv,
+        )
+
+        clean_report = generate_clean_report(clean_groups, destination, isolation_dir_name)
+        rp = Path(report_path)
+        with open(rp, 'w', encoding='utf-8') as f:
+            f.write(clean_report)
+        print(f"清理报告已保存到: {rp.resolve()}")
         sys.exit(0)
 
     if not source:
@@ -656,6 +912,7 @@ def main():
         incremental=incremental,
         state_file=state_file,
         duplicate_csv=duplicate_csv,
+        plan_file=plan_file,
     )
 
     rp = Path(report_path)
@@ -665,7 +922,10 @@ def main():
     print(f"\n整理完成!")
     print(f"报告已保存到: {rp.resolve()}")
     print(f"共处理 {len(operations)} 个文件")
-    print(f"目标库健康检查: {health_stats['duplicate_groups']} 组重复, {health_stats['empty_month_dirs']} 个空文件夹")
+    print(f"健康检查: {health_stats['duplicate_groups']} 组重复, "
+          f"{health_stats['no_exif_has_mtime']} 张无EXIF, "
+          f"{health_stats['no_time_at_all']} 张无时间, "
+          f"{health_stats['read_failed']} 张读取失败")
 
 
 if __name__ == '__main__':
