@@ -3,6 +3,9 @@
   "destination": "",
   "ignore_folders": [],
   "report": "photo_organize_report.md",
+  "duplicate_csv": "duplicates.csv",
+  "state_file": "library_state.json",
   "dry_run": false,
+  "incremental": true,
   "duplicate_mode": "separate"
 }
