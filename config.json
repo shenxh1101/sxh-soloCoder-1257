@@ -1,0 +1,8 @@
+{
+  "source": "",
+  "destination": "",
+  "ignore_folders": [],
+  "report": "photo_organize_report.md",
+  "dry_run": false,
+  "duplicate_mode": "separate"
+}
