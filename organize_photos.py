@@ -266,7 +266,14 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
     dest_dir = Path(dest_dir).resolve()
     duplicate_dir = dest_dir / '可能重复'
 
-    state = load_json(state_file) if incremental and state_file else {'photos': {}}
+    state = {'photos': {}}
+    if incremental and state_file:
+        loaded = load_json(state_file)
+        if loaded and 'photos' in loaded:
+            state = loaded
+            print(f"已加载状态文件: {state_file} ({len(state['photos'])} 条记录)")
+        else:
+            print(f"状态文件不存在或为空，将从空状态开始 (后续将自动创建: {state_file})")
     known_md5s = {entry['md5']: entry for entry in state.get('photos', {}).values()}
 
     dest_md5_map = scan_dest_library(dest_dir, ignore_folders)
@@ -413,6 +420,7 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
 
         if incremental and state_file:
             save_json(state_file, state)
+            print(f"状态文件已保存: {state_file} ({len(state.get('photos', {}))} 条记录)")
 
     monthly_stats = _build_monthly_stats(move_operations, duplicate_operations)
     health_stats = check_library_health(dest_dir, ignore_folders)
@@ -426,7 +434,7 @@ def organize_photos(source_dir, dest_dir, ignore_folders, dry_run=False,
     if duplicate_csv and duplicate_operations:
         export_duplicate_csv(duplicate_csv, duplicate_operations, md5_map)
 
-    return report, all_operations, health_stats
+    return report, all_operations, health_stats, skipped
 
 
 def execute_plan(plan_path, incremental=True, state_file=None):
@@ -444,7 +452,17 @@ def execute_plan(plan_path, incremental=True, state_file=None):
     print(f"计划移动: {len(move_ops)} 个文件")
     print(f"计划重复处理: {len(dup_ops)} 个文件")
 
-    state = load_json(state_file) if incremental and state_file else {'photos': {}}
+    state = {'photos': {}}
+    if incremental and state_file:
+        loaded = load_json(state_file)
+        if loaded and 'photos' in loaded:
+            state = loaded
+            print(f"已加载状态文件: {state_file} ({len(state['photos'])} 条记录)")
+        else:
+            print(f"状态文件不存在或为空，将从空状态开始 (执行完成后将自动创建)")
+
+    executed_count = 0
+    skipped_count = 0
 
     for op in all_ops:
         src = op['source']
@@ -456,13 +474,14 @@ def execute_plan(plan_path, incremental=True, state_file=None):
             continue
 
         if not Path(src).exists():
-            print(f"警告: 源文件不存在，跳过: {src}")
+            print(f"  跳过 (源文件不存在): {src}")
+            skipped_count += 1
             continue
 
         dst_path = Path(dst)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(src, dst)
-        print(f"  移动: {src} -> {dst}")
+        executed_count += 1
 
         if op_type in ('kept', 'normal') and incremental and state_file:
             state.setdefault('photos', {})[md5] = {
@@ -476,8 +495,12 @@ def execute_plan(plan_path, incremental=True, state_file=None):
 
     if incremental and state_file:
         save_json(state_file, state)
+        print(f"状态文件已保存: {state_file} ({len(state.get('photos', {}))} 条记录)")
 
-    print(f"\n计划执行完成! 共处理 {len(all_ops)} 个操作")
+    print(f"\n计划执行完成!")
+    print(f"  成功执行: {executed_count} 个操作")
+    print(f"  跳过: {skipped_count} 个 (源文件不存在)")
+    print(f"  重复(仅列出): {sum(1 for o in dup_ops if o['type'] == 'duplicate_listed')} 个")
 
 
 def clean_duplicates(dest_dir, ignore_folders, plan_only=True, isolation_dir_name='隔离重复', duplicate_csv=None):
@@ -807,6 +830,10 @@ def main():
     destination = args.destination if args.destination is not None else cfg.get('destination', '')
     ignore_folders = args.ignore if args.ignore is not None else cfg.get('ignore_folders', [])
 
+    if not destination and source:
+        destination = source
+        source = ''
+
     if args.dry_run is True:
         dry_run = True
     elif args.no_dry_run is True:
@@ -829,17 +856,39 @@ def main():
     isolation_dir_name = cfg.get('isolation_dir', '隔离重复')
 
     if args.execute_plan:
-        execute_plan(args.execute_plan, incremental=incremental, state_file=state_file)
+        plan = load_json(args.execute_plan)
+        if not plan:
+            print(f"错误: 计划文件不存在或格式错误: {args.execute_plan}")
+            sys.exit(1)
+        dest_dir = plan.get('dest_dir', '')
+        if dest_dir:
+            state_file_path = Path(dest_dir) / state_file if not Path(state_file).is_absolute() else Path(state_file)
+        else:
+            state_file_path = Path(state_file)
+        if not state_file_path.parent.exists():
+            state_file_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"执行计划文件: {args.execute_plan}")
+        print(f"目标目录: {dest_dir}")
+        print(f"状态文件: {state_file_path}")
+        execute_plan(args.execute_plan, incremental=incremental, state_file=str(state_file_path))
         sys.exit(0)
 
     if not destination:
-        print("错误: 未指定目标目录。请通过命令行参数或配置文件提供 destination。")
+        print("错误: 未指定目标目录。")
+        print("用法: python organize_photos.py [源目录] 目标目录 [选项]")
+        print("  整理照片: python organize_photos.py 源目录 目标目录")
+        print("  健康检查: python organize_photos.py 目标目录 --health-check-only")
+        print("  清理重复: python organize_photos.py 目标目录 --clean-duplicates")
         sys.exit(1)
 
+    if not Path(destination).exists():
+        print(f"目标目录不存在: {destination} (将自动创建)")
+
     if args.health_check_only:
-        print("仅执行健康检查...")
+        print(f"相册库健康检查: {destination}")
+        print()
         health_stats = check_library_health(destination, ignore_folders)
-        print(f"\n目标库健康检查结果:")
+        print(f"目标库健康检查结果:")
         print(f"  重复文件组: {health_stats['duplicate_groups']}")
         print(f"  重复文件数(多余): {health_stats['duplicate_files']}")
         print(f"  空月份文件夹: {health_stats['empty_month_dirs']}")
@@ -857,7 +906,7 @@ def main():
         sys.exit(0)
 
     if args.clean_duplicates:
-        print("清理目标库重复照片...")
+        print(f"清理目标库重复照片: {destination}")
         plan_only = not args.clean_execute
         if plan_only:
             print("模式: 仅生成清理清单 (使用 --clean-execute 实际执行隔离)")
@@ -876,10 +925,17 @@ def main():
         with open(rp, 'w', encoding='utf-8') as f:
             f.write(clean_report)
         print(f"清理报告已保存到: {rp.resolve()}")
+        if clean_groups:
+            print(f"发现 {len(clean_groups)} 组重复, "
+                  f"{sum(len(g['isolated']) for g in clean_groups)} 个文件待隔离")
+        else:
+            print("未发现重复照片")
         sys.exit(0)
 
     if not source:
-        print("错误: 未指定源目录。请通过命令行参数或配置文件提供 source。")
+        print("错误: 未指定源目录。")
+        print("用法: python organize_photos.py 源目录 目标目录 [选项]")
+        print("示例: python organize_photos.py D:\\新照片 E:\\相册库 --dry-run")
         sys.exit(1)
 
     if not EXIF_AVAILABLE:
@@ -903,7 +959,7 @@ def main():
         print(f"忽略文件夹: {[str(p) for p in resolved_ignore]}")
     print()
 
-    report, operations, health_stats = organize_photos(
+    report, operations, health_stats, skipped = organize_photos(
         source_dir=source,
         dest_dir=destination,
         ignore_folders=resolved_ignore,
@@ -921,11 +977,16 @@ def main():
 
     print(f"\n整理完成!")
     print(f"报告已保存到: {rp.resolve()}")
-    print(f"共处理 {len(operations)} 个文件")
-    print(f"健康检查: {health_stats['duplicate_groups']} 组重复, "
-          f"{health_stats['no_exif_has_mtime']} 张无EXIF, "
-          f"{health_stats['no_time_at_all']} 张无时间, "
-          f"{health_stats['read_failed']} 张读取失败")
+    moved = sum(1 for o in operations if o[2] in ('kept', 'normal'))
+    dups = sum(1 for o in operations if o[2].startswith('duplicate'))
+    print(f"移动: {moved} 个 | 重复处理: {dups} 个 | 跳过: {len(skipped)} 个")
+    if health_stats['duplicate_groups'] > 0 or health_stats['read_failed'] > 0:
+        print(f"健康检查: {health_stats['duplicate_groups']} 组重复, "
+              f"{health_stats['no_exif_has_mtime']} 张无EXIF, "
+              f"{health_stats['no_time_at_all']} 张无时间, "
+              f"{health_stats['read_failed']} 张读取失败")
+    else:
+        print(f"健康检查: 目标库状态良好")
 
 
 if __name__ == '__main__':
